@@ -1,0 +1,166 @@
+#define USB_PRODUCT "HPS Tiller"
+#define USB_MANUFACTURER "HPS Engineering"
+
+#include <Joystick.h>
+
+// ==========================
+// CONFIGURATION
+// ==========================
+#define AXIS_PIN A0
+#define BUTTON_PIN 2              // Active LOW button
+#define FILTER_STRENGTH 0.25
+#define CENTER_DEADZONE 15        // +/- deadzone around center
+
+// ==========================
+// HID CONFIG (1-axis joystick)
+// ==========================
+Joystick_ Joystick(
+  JOYSTICK_DEFAULT_REPORT_ID,
+  JOYSTICK_TYPE_GAMEPAD,
+  0,   // button count
+  0,   // hat count
+  true,   // X
+  false,  // Y
+  false,  // Z
+  false,  // Rx
+  false,  // Ry
+  false,  // Rz
+  false,  // rudder
+  false,  // throttle
+  false,  // accelerator
+  false,  // brake
+  false   // steering
+);
+
+// ==========================
+// VARIABLES
+// ==========================
+int centerValue = 512;
+int rightValue  = 800;
+int leftValue   = 200;
+
+int filteredValue = 0;
+
+bool calMode = true;
+int calStep = 1;
+
+bool readButton() {
+  return (digitalRead(BUTTON_PIN) == LOW);   // active LOW
+}
+
+void setup() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n===== AUTO CALIBRATION START =====");
+
+  Joystick.begin();
+
+  filteredValue = analogRead(AXIS_PIN);
+}
+
+// ======================================================
+// MAIN LOOP
+// ======================================================
+void loop() {
+
+  bool pressed = readButton();
+  static bool lastPressed = false;
+
+  // ======================================================
+  //              CALIBRATION MODE
+  // ======================================================
+  if (calMode) {
+
+    int raw = analogRead(AXIS_PIN);
+
+    if (calStep == 1) {
+      Serial.println("STEP 1: Move to CENTER, press button...");
+      if (!lastPressed && pressed) {
+        centerValue = raw;
+        Serial.print("CENTER saved: ");
+        Serial.println(centerValue);
+        calStep = 2;
+      }
+    }
+
+    else if (calStep == 2) {
+      Serial.println("STEP 2: Move FULL RIGHT, press button...");
+      if (!lastPressed && pressed) {
+        rightValue = raw;
+        Serial.print("RIGHT saved: ");
+        Serial.println(rightValue);
+        calStep = 3;
+      }
+    }
+
+    else if (calStep == 3) {
+      Serial.println("STEP 3: Move FULL LEFT, press button...");
+      if (!lastPressed && pressed) {
+        leftValue = raw;
+        Serial.print("LEFT saved: ");
+        Serial.println(leftValue);
+
+        calMode = false;
+        Serial.println("===== CALIBRATION COMPLETE =====");
+      }
+    }
+
+    lastPressed = pressed;
+    delay(10);
+    return;
+  }
+
+  // ======================================================
+  //              NORMAL OPERATION
+  // ======================================================
+  lastPressed = pressed;
+
+  int raw = analogRead(AXIS_PIN);
+
+  // Soft filter
+  filteredValue = filteredValue + FILTER_STRENGTH * (raw - filteredValue);
+
+  long output;
+
+  // ===========================
+  // CENTER DEADZONE
+  // ===========================
+  if (abs(filteredValue - centerValue) <= CENTER_DEADZONE) {
+
+    output = 512;   // perfect center
+
+  } else if (filteredValue > centerValue + CENTER_DEADZONE) {
+    // Right side
+    output = map(filteredValue,
+                 centerValue + CENTER_DEADZONE, rightValue,
+                 512, 1023);
+  } else {
+    // Left side
+    output = map(filteredValue,
+                 leftValue, centerValue - CENTER_DEADZONE,
+                 0, 512);
+  }
+
+  output = constrain(output, 0, 1023);
+
+  // ====================================
+  // SEND TO HID JOYSTICK
+  // ====================================
+  Joystick.setXAxis(output);
+
+  // ====================================
+  // SERIAL DEBUG OUTPUT
+  // ====================================
+  Serial.print("RAW=");
+  Serial.print(raw);
+  Serial.print("  FILT=");
+  Serial.print(filteredValue);
+  Serial.print("  OUT=");
+  Serial.print(output);
+  Serial.print("  BTN=");
+  Serial.println(pressed ? 0 : 1);  // Active LOW
+
+  delay(5);
+}

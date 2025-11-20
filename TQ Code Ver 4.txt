@@ -1,0 +1,180 @@
+#include <Joystick.h>
+
+/*
+  HPS Engineering Dual Throttle Quadrant
+  - Independent calibration for both throttles (button-based, 30s each)
+  - Throttle1: A0, A/T D2, Reverser D3
+  - Throttle2: A1, A/T D4, Reverser D5
+  - Press A/T button at full REVERSE -> capture MIN
+  - Press A/T button at full TOGA    -> capture MAX
+  - No EEPROM storage; recalibrates every reset
+*/
+
+Joystick_ Joystick(
+  JOYSTICK_DEFAULT_REPORT_ID,
+  JOYSTICK_TYPE_JOYSTICK,
+  4, 0,                 // 4 buttons (2 AT + 2 REV)
+  true, true, false,    // X=Throttle1, Y=Throttle2
+  false, false, false,
+  false, false,
+  false, false, false
+);
+
+// Pins
+const int throttle1Pin = A0;
+const int throttle2Pin = A1;
+
+const int atDisc1Pin = 2;
+const int rev1Pin    = 3;
+const int atDisc2Pin = 4;
+const int rev2Pin    = 5;
+
+// Filtering
+const uint8_t OVERSAMPLE = 6;
+const float ALPHA = 0.35;
+const int DEADBAND = 3;
+
+// State
+float smoothed1 = -1.0, smoothed2 = -1.0;
+int lastSent1 = -1, lastSent2 = -1;
+
+// Calibration values
+int ADC1_MIN = 1023, ADC1_MAX = 0;
+int ADC2_MIN = 1023, ADC2_MAX = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(40);
+  Serial.println("\nHPS Engineering Dual Throttle Quadrant - Button Calibration");
+  Serial.println("Throttle 1: A0 / D2 A/T / D3 REV");
+  Serial.println("Throttle 2: A1 / D4 A/T / D5 REV");
+
+  pinMode(atDisc1Pin, INPUT_PULLUP);
+  pinMode(rev1Pin, INPUT_PULLUP);
+  pinMode(atDisc2Pin, INPUT_PULLUP);
+  pinMode(rev2Pin, INPUT_PULLUP);
+
+  Joystick.setXAxisRange(0, 1023);
+  Joystick.setYAxisRange(0, 1023);
+  Joystick.begin();
+
+  calibrateThrottle(throttle1Pin, atDisc1Pin, ADC1_MIN, ADC1_MAX, "Throttle 1");
+  calibrateThrottle(throttle2Pin, atDisc2Pin, ADC2_MIN, ADC2_MAX, "Throttle 2");
+
+  Serial.println("\nCalibration complete. Running...");
+  Serial.println("Analog1 | Analog2 | Out1 | Out2 | %1 | %2 | AT1 | REV1 | AT2 | REV2");
+}
+
+void loop() {
+  int raw1 = readOversampledADC(throttle1Pin, OVERSAMPLE);
+  int raw2 = readOversampledADC(throttle2Pin, OVERSAMPLE);
+
+  // smoothing
+  if (smoothed1 < 0) smoothed1 = raw1;
+  if (smoothed2 < 0) smoothed2 = raw2;
+  smoothed1 = ALPHA * raw1 + (1 - ALPHA) * smoothed1;
+  smoothed2 = ALPHA * raw2 + (1 - ALPHA) * smoothed2;
+
+  int out1 = mapThrottle((int)smoothed1, ADC1_MIN, ADC1_MAX);
+  int out2 = mapThrottle((int)smoothed2, ADC2_MIN, ADC2_MAX);
+
+  // send if changed
+  if (lastSent1 < 0 || abs(out1 - lastSent1) >= DEADBAND) {
+    Joystick.setXAxis(out1);
+    lastSent1 = out1;
+  }
+  if (lastSent2 < 0 || abs(out2 - lastSent2) >= DEADBAND) {
+    Joystick.setYAxis(out2);
+    lastSent2 = out2;
+  }
+
+  // buttons
+  bool at1 = (digitalRead(atDisc1Pin) == LOW);
+  bool rev1 = (digitalRead(rev1Pin) == LOW);
+  bool at2 = (digitalRead(atDisc2Pin) == LOW);
+  bool rev2 = (digitalRead(rev2Pin) == LOW);
+
+  Joystick.setButton(0, at1);
+  Joystick.setButton(1, rev1);
+  Joystick.setButton(2, at2);
+  Joystick.setButton(3, rev2);
+
+  // serial monitor
+  Serial.print(analogRead(throttle1Pin)); Serial.print("\t| ");
+  Serial.print(analogRead(throttle2Pin)); Serial.print("\t| ");
+  Serial.print(out1); Serial.print("\t| ");
+  Serial.print(out2); Serial.print("\t| ");
+  Serial.print(map(out1, 0, 1023, 0, 100)); Serial.print("%\t| ");
+  Serial.print(map(out2, 0, 1023, 0, 100)); Serial.print("%\t| ");
+  Serial.print(at1 ? "AT1 " : "    ");
+  Serial.print(rev1 ? "REV1 " : "     ");
+  Serial.print(at2 ? "AT2 " : "    ");
+  Serial.println(rev2 ? "REV2" : "");
+  delay(10);
+}
+
+// ------------------------------------------------------------------
+// Helper Functions
+// ------------------------------------------------------------------
+
+int readOversampledADC(int pin, uint8_t samples) {
+  long sum = 0;
+  for (uint8_t i = 0; i < samples; ++i) sum += analogRead(pin);
+  return sum / samples;
+}
+
+int mapThrottle(int val, int minVal, int maxVal) {
+  if (minVal == maxVal) return val;
+  if (minVal < maxVal) {
+    val = constrain(val, minVal, maxVal);
+    return map(val, minVal, maxVal, 0, 1023);
+  } else {
+    val = constrain(val, maxVal, minVal);
+    return map(val, maxVal, minVal, 1023, 0);
+  }
+}
+
+void calibrateThrottle(int analogPin, int buttonPin, int &minVal, int &maxVal, const char *label) {
+  Serial.print("\n=== "); Serial.print(label); Serial.println(" Calibration ===");
+  Serial.println("Press A/T at full REVERSE (min), then full TOGA (max). 30s window.");
+
+  unsigned long start = millis();
+  unsigned long timeout = 30000UL;
+  bool minSet = false, maxSet = false;
+  int lastBtn = HIGH;
+
+  while (millis() - start < timeout) {
+    int btn = digitalRead(buttonPin);
+
+    if (lastBtn == HIGH && btn == LOW) {
+      int val = readOversampledADC(analogPin, OVERSAMPLE);
+      if (!minSet) {
+        minVal = val;
+        minSet = true;
+        Serial.print("Captured MIN = "); Serial.println(minVal);
+      } else if (!maxSet) {
+        maxVal = val;
+        maxSet = true;
+        Serial.print("Captured MAX = "); Serial.println(maxVal);
+        break;
+      }
+      delay(300);
+    }
+    lastBtn = btn;
+
+    if ((millis() - start) % 2000 < 10) {
+      unsigned long remain = (start + timeout - millis()) / 1000;
+      Serial.print("...waiting ("); Serial.print(remain); Serial.println("s left)");
+    }
+
+    delay(10);
+  }
+
+  if (!minSet || !maxSet || minVal == maxVal) {
+    minVal = 0; maxVal = 1023;
+    Serial.println("⚠️ Calibration invalid. Using default 0–1023.");
+  }
+
+  Serial.print(label); Serial.print(" final range: ");
+  Serial.print(minVal); Serial.print(" – "); Serial.println(maxVal);
+}
